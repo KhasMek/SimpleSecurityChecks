@@ -2,12 +2,16 @@ package com.khasmek.simplesecuritychecks.checker
 
 import android.app.KeyguardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Debug
 import android.provider.Settings
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.security.keystore.StrongBoxUnavailableException
 import android.view.Display
 import com.khasmek.simplesecuritychecks.model.CheckCategory
 import com.khasmek.simplesecuritychecks.model.CheckItem
@@ -15,7 +19,11 @@ import com.khasmek.simplesecuritychecks.model.CheckResult
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.security.KeyPairGenerator
+import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.cert.X509Certificate
+import java.security.spec.ECGenParameterSpec
 
 private data class IntegrityOutcome(val result: CheckResult, val detail: String)
 
@@ -108,6 +116,18 @@ object IntegrityChecker {
             )
         ),
         CheckCategory(
+            id = "hardware_security",
+            name = "Hardware Security",
+            description = "Key attestation and hardware-backed security features",
+            items = listOf(
+                CheckItem("Key attestation supported"),
+                CheckItem("Attestation backed by hardware"),
+                CheckItem("Google attestation root certificate"),
+                CheckItem("StrongBox keystore available"),
+                CheckItem("Biometric hardware present"),
+            )
+        ),
+        CheckCategory(
             id = "screen_capture_protection",
             name = "Screen Capture Protection",
             description = "Detect FLAG_SECURE bypass tools and screen capture threats",
@@ -146,6 +166,7 @@ object IntegrityChecker {
                 "app_installation" -> runAppInstallationCheck(label, context)
                 "hooking_detection" -> runHookingDetectionCheck(label)
                 "process_environment" -> runProcessEnvironmentCheck(label, context)
+                "hardware_security" -> runHardwareSecurityCheck(label, context)
                 "screen_capture_protection" -> runScreenCaptureProtectionCheck(label, context)
                 else -> IntegrityOutcome(CheckResult.ERROR, "Unknown category")
             }
@@ -772,6 +793,185 @@ object IntegrityChecker {
                     IntegrityOutcome(CheckResult.DETECTED, evidence.joinToString("; "))
                 } else {
                     IntegrityOutcome(CheckResult.NOT_DETECTED, "No suspicious environment variables")
+                }
+            }
+            else -> IntegrityOutcome(CheckResult.ERROR, "Unknown check")
+        }
+    }
+
+    // ── Hardware Security ──
+
+    private val ATTESTATION_EXTENSION_OID = "1.3.6.1.4.1.11129.2.1.17"
+    private val ATTESTATION_KEY_ALIAS = "ssc_attestation_test"
+
+    private fun generateAttestedKey(): Array<out java.security.cert.Certificate>? {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore")
+        keyStore.load(null)
+        try { keyStore.deleteEntry(ATTESTATION_KEY_ALIAS) } catch (_: Exception) { }
+        val keyPairGenerator = KeyPairGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
+        )
+        keyPairGenerator.initialize(
+            KeyGenParameterSpec.Builder(ATTESTATION_KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                .setAttestationChallenge("ssc_challenge".toByteArray())
+                .build()
+        )
+        keyPairGenerator.generateKeyPair()
+        val chain = keyStore.getCertificateChain(ATTESTATION_KEY_ALIAS)
+        try { keyStore.deleteEntry(ATTESTATION_KEY_ALIAS) } catch (_: Exception) { }
+        return chain
+    }
+
+    private fun parseAttestationSecurityLevel(cert: X509Certificate): Int? {
+        val extensionValue = cert.getExtensionValue(ATTESTATION_EXTENSION_OID) ?: return null
+        return try {
+            var offset = 0
+            // Unwrap outer OCTET STRING (tag 0x04)
+            if (extensionValue[offset].toInt() and 0xFF != 0x04) return null
+            offset++
+            offset += derLengthSize(extensionValue, offset)
+
+            // SEQUENCE (tag 0x30)
+            if (extensionValue[offset].toInt() and 0xFF != 0x30) return null
+            offset++
+            offset += derLengthSize(extensionValue, offset)
+
+            // INTEGER attestationVersion (tag 0x02)
+            if (extensionValue[offset].toInt() and 0xFF != 0x02) return null
+            offset++
+            val intLen = derReadLength(extensionValue, offset)
+            offset += derLengthSize(extensionValue, offset) + intLen
+
+            // ENUMERATED attestationSecurityLevel (tag 0x0A)
+            if (extensionValue[offset].toInt() and 0xFF != 0x0A) return null
+            offset++
+            offset += derLengthSize(extensionValue, offset)
+            extensionValue[offset].toInt() and 0xFF
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun derReadLength(data: ByteArray, offset: Int): Int {
+        val first = data[offset].toInt() and 0xFF
+        if (first < 0x80) return first
+        val numBytes = first and 0x7F
+        var length = 0
+        for (i in 1..numBytes) {
+            length = (length shl 8) or (data[offset + i].toInt() and 0xFF)
+        }
+        return length
+    }
+
+    private fun derLengthSize(data: ByteArray, offset: Int): Int {
+        val first = data[offset].toInt() and 0xFF
+        return if (first < 0x80) 1 else 1 + (first and 0x7F)
+    }
+
+    private fun runHardwareSecurityCheck(label: String, context: Context): IntegrityOutcome {
+        return when (label) {
+            "Key attestation supported" -> {
+                try {
+                    val chain = generateAttestedKey()
+                    if (chain == null || chain.isEmpty()) {
+                        IntegrityOutcome(CheckResult.NOT_DETECTED, "No attestation certificate chain returned")
+                    } else {
+                        val leaf = chain[0] as X509Certificate
+                        val hasExtension = leaf.getExtensionValue(ATTESTATION_EXTENSION_OID) != null
+                        if (hasExtension) {
+                            IntegrityOutcome(CheckResult.DETECTED, "Attestation chain has ${chain.size} cert(s), extension OID present")
+                        } else {
+                            IntegrityOutcome(CheckResult.NOT_DETECTED, "Chain has ${chain.size} cert(s) but attestation extension missing")
+                        }
+                    }
+                } catch (e: Exception) {
+                    IntegrityOutcome(CheckResult.NOT_DETECTED, "Key attestation not available: ${e.javaClass.simpleName}: ${e.message?.take(100)}")
+                }
+            }
+            "Attestation backed by hardware" -> {
+                try {
+                    val chain = generateAttestedKey()
+                    if (chain == null || chain.isEmpty()) {
+                        return IntegrityOutcome(CheckResult.NOT_DETECTED, "No attestation chain available")
+                    }
+                    val leaf = chain[0] as X509Certificate
+                    val securityLevel = parseAttestationSecurityLevel(leaf)
+                    when (securityLevel) {
+                        null -> IntegrityOutcome(CheckResult.NOT_DETECTED, "Could not parse attestation extension")
+                        0 -> IntegrityOutcome(CheckResult.NOT_DETECTED, "Security level: Software (not hardware-backed)")
+                        1 -> IntegrityOutcome(CheckResult.DETECTED, "Security level: TrustedEnvironment (TEE)")
+                        2 -> IntegrityOutcome(CheckResult.DETECTED, "Security level: StrongBox")
+                        else -> IntegrityOutcome(CheckResult.NOT_DETECTED, "Unknown security level: $securityLevel")
+                    }
+                } catch (e: Exception) {
+                    IntegrityOutcome(CheckResult.NOT_DETECTED, "Cannot check: ${e.javaClass.simpleName}: ${e.message?.take(100)}")
+                }
+            }
+            "Google attestation root certificate" -> {
+                try {
+                    val chain = generateAttestedKey()
+                    if (chain == null || chain.size < 2) {
+                        return IntegrityOutcome(CheckResult.NOT_DETECTED, "Attestation chain too short (${chain?.size ?: 0} cert(s))")
+                    }
+                    val root = chain.last() as X509Certificate
+                    val subject = root.subjectX500Principal.name
+                    val isGoogle = subject.contains("Google", ignoreCase = true) &&
+                        subject.contains("Attestation", ignoreCase = true)
+                    if (isGoogle) {
+                        IntegrityOutcome(CheckResult.DETECTED, "Root: $subject")
+                    } else {
+                        IntegrityOutcome(CheckResult.NOT_DETECTED, "Root is not Google attestation: $subject")
+                    }
+                } catch (e: Exception) {
+                    IntegrityOutcome(CheckResult.NOT_DETECTED, "Cannot check: ${e.javaClass.simpleName}: ${e.message?.take(100)}")
+                }
+            }
+            "StrongBox keystore available" -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                    return IntegrityOutcome(CheckResult.NOT_DETECTED, "StrongBox requires API 28+, device is API ${Build.VERSION.SDK_INT}")
+                }
+                try {
+                    val alias = "ssc_strongbox_test"
+                    val keyStore = KeyStore.getInstance("AndroidKeyStore")
+                    keyStore.load(null)
+                    try { keyStore.deleteEntry(alias) } catch (_: Exception) { }
+                    val keyPairGenerator = KeyPairGenerator.getInstance(
+                        KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
+                    )
+                    keyPairGenerator.initialize(
+                        KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                            .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                            .setDigests(KeyProperties.DIGEST_SHA256)
+                            .setIsStrongBoxBacked(true)
+                            .build()
+                    )
+                    keyPairGenerator.generateKeyPair()
+                    try { keyStore.deleteEntry(alias) } catch (_: Exception) { }
+                    IntegrityOutcome(CheckResult.DETECTED, "StrongBox key generation succeeded")
+                } catch (_: StrongBoxUnavailableException) {
+                    IntegrityOutcome(CheckResult.NOT_DETECTED, "StrongBox not available on this device")
+                } catch (e: Exception) {
+                    if (e.cause is StrongBoxUnavailableException) {
+                        IntegrityOutcome(CheckResult.NOT_DETECTED, "StrongBox not available on this device")
+                    } else {
+                        IntegrityOutcome(CheckResult.ERROR, "${e.javaClass.simpleName}: ${e.message?.take(100)}")
+                    }
+                }
+            }
+            "Biometric hardware present" -> {
+                val pm = context.packageManager
+                val features = mutableListOf<String>()
+                if (pm.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT)) features.add("fingerprint")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    if (pm.hasSystemFeature(PackageManager.FEATURE_FACE)) features.add("face")
+                    if (pm.hasSystemFeature(PackageManager.FEATURE_IRIS)) features.add("iris")
+                }
+                if (features.isNotEmpty()) {
+                    IntegrityOutcome(CheckResult.DETECTED, "Biometric hardware: ${features.joinToString()}")
+                } else {
+                    IntegrityOutcome(CheckResult.NOT_DETECTED, "No biometric hardware features found")
                 }
             }
             else -> IntegrityOutcome(CheckResult.ERROR, "Unknown check")
