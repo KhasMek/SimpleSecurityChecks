@@ -111,6 +111,7 @@ object IntegrityChecker {
             items = listOf(
                 CheckItem("Accessibility services active"),
                 CheckItem("VPN connection active"),
+                CheckItem("HTTP proxy configured"),
                 CheckItem("Running as root/system UID"),
                 CheckItem("Suspicious environment variables"),
             )
@@ -767,6 +768,22 @@ object IntegrityChecker {
                     }
                 } else {
                     IntegrityOutcome(CheckResult.NOT_DETECTED, "No active network")
+                }
+            }
+            "HTTP proxy configured" -> {
+                val evidence = mutableListOf<String>()
+                val httpHost = System.getProperty("http.proxyHost")
+                val httpPort = System.getProperty("http.proxyPort")
+                if (!httpHost.isNullOrEmpty()) evidence.add("http.proxyHost=$httpHost:${httpPort ?: "?"}")
+                val httpsHost = System.getProperty("https.proxyHost")
+                val httpsPort = System.getProperty("https.proxyPort")
+                if (!httpsHost.isNullOrEmpty()) evidence.add("https.proxyHost=$httpsHost:${httpsPort ?: "?"}")
+                val globalProxy = Settings.Global.getString(context.contentResolver, Settings.Global.HTTP_PROXY)
+                if (!globalProxy.isNullOrEmpty() && globalProxy != ":0") evidence.add("Global HTTP_PROXY=$globalProxy")
+                if (evidence.isNotEmpty()) {
+                    IntegrityOutcome(CheckResult.DETECTED, evidence.joinToString("; "))
+                } else {
+                    IntegrityOutcome(CheckResult.NOT_DETECTED, "No HTTP/HTTPS proxy configured")
                 }
             }
             "Running as root/system UID" -> {
